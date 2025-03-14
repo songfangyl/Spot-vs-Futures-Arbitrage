@@ -10,8 +10,9 @@ import json
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 import time
-
+import pandas as pd
 import ccxt
 
 # Load environment variables
@@ -772,6 +773,287 @@ class OKXTrader:
             print(f"Error: {e}")
             return {'error': str(e)}
 
+    # Part 1
+    def fetch_triangle_market_data(self):
+        """
+        Fetches market data required for triangle arbitrage between BTC/USDT, ETH/USDT, and ETH/BTC.
+        Returns a dictionary with:
+          - The 'last' price and base volume for each pair.
+          - A timestamp indicating when the data was fetched.
+        """
+        try:
+            ticker_btc_usdt = self.exchange.fetch_ticker("BTC/USDT")
+            ticker_eth_usdt = self.exchange.fetch_ticker("ETH/USDT")
+            ticker_eth_btc = self.exchange.fetch_ticker("ETH/BTC")
+            
+            data = {
+                "timestamp": datetime.now().isoformat(),
+                "BTC/USDT": {
+                    "last": ticker_btc_usdt.get("last"),
+                    "volume": ticker_btc_usdt.get("baseVolume")
+                },
+                "ETH/USDT": {
+                    "last": ticker_eth_usdt.get("last"),
+                    "volume": ticker_eth_usdt.get("baseVolume")
+                },
+                "ETH/BTC": {
+                    "last": ticker_eth_btc.get("last"),
+                    "volume": ticker_eth_btc.get("baseVolume")
+                }
+            }
+            logger.info(f"Fetched triangle market data: {data}")
+            return data
+        except Exception as e:
+            logger.error(f"Error fetching triangle market data: {e}")
+            return None
+
+    def store_triangle_data_to_json(self, data, filename="triangle_market_data.json"):
+        """
+        Stores the fetched triangle market data into a JSON file using a Pandas DataFrame.
+        
+        Parameters:
+          data (dict): The triangle market data.
+          filename (str): The output JSON filename.
+        
+        Returns:
+          A Pandas DataFrame if successful; otherwise, None.
+        """
+        try:
+            if data is None:
+                logger.error("No triangle data to store.")
+                return None
+            # Wrap the data in a list to create a single-row DataFrame.
+            df = pd.DataFrame([data])
+            df.to_json(filename, orient='records', date_format='iso', indent=4)
+            logger.info(f"Triangle market data saved to {filename}.")
+            return df
+        except Exception as e:
+            logger.error(f"Error saving triangle market data to JSON: {e}")
+            return None
+
+    # Part 2
+    def check_triangle_arbitrage(self, threshold=0.002, data=None):
+        """
+        Checks for triangle arbitrage opportunities using the three spot pairs.
+        If 'data' is provided, it is used; otherwise, live data is fetched.
+        
+        Returns a dictionary with computed cycle factors and opportunity flags.
+        """
+        try:
+            if data is None:
+                data = self.fetch_triangle_market_data()
+                if data is None:
+                    logger.error("No market data available for triangle arbitrage check.")
+                    return None
+
+            if not isinstance(data, dict):
+                logger.error("Expected data to be a dictionary but got a different type.")
+                return None
+
+            # For live data, values might be dicts with a "last" key.
+            def get_price(val):
+                return val.get("last") if isinstance(val, dict) else val
+
+            btc_usdt = get_price(data.get("BTC/USDT"))
+            eth_usdt = get_price(data.get("ETH/USDT"))
+            eth_btc = get_price(data.get("ETH/BTC"))
+
+            if not (btc_usdt and eth_usdt and eth_btc):
+                logger.error("Missing one or more ticker prices in the fetched data.")
+                return None
+
+            cycle1 = eth_usdt / (btc_usdt * eth_btc)
+            cycle2 = (btc_usdt * eth_btc) / eth_usdt
+
+            result = {
+                "timestamp": data.get("timestamp"),
+                "BTC/USDT": btc_usdt,
+                "ETH/USDT": eth_usdt,
+                "ETH/BTC": eth_btc,
+                "Cycle1_factor": cycle1,
+                "Cycle1_opportunity": cycle1 > (1 + threshold),
+                "Cycle2_factor": cycle2,
+                "Cycle2_opportunity": cycle2 > (1 + threshold),
+                "threshold": threshold
+            }
+            logger.info(f"Triangle arbitrage signal: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error checking triangle arbitrage: {e}")
+            return None
+
+
+     # ---------------------------
+    # Historical Data Functions (Single Function for Entire Period)
+    # ---------------------------
+    def fetch_all_historical_triangle_data_incremental(self, start_dt, end_dt, timeframe="1m", limit=100, chunk_minutes=100, filename="triangle_market_data_historical.json"):
+        """
+        Incrementally fetches historical triangle data for BTC/USDT, ETH/USDT, and ETH/BTC from start_dt until end_dt.
+        Because each API call returns at most 'limit' candles, the function divides the period into chunks of
+        'chunk_minutes' minutes. For each chunk, it fetches the data for each pair, merges them by common timestamps,
+        and immediately appends the merged records to a JSON file.
+        
+        Parameters:
+            start_dt (datetime): The starting datetime (UTC).
+            end_dt (datetime): The ending datetime (UTC).
+            timeframe (str): The timeframe for OHLCV data (default "1m").
+            limit (int): Maximum number of candles per API call (default 100).
+            chunk_minutes (int): Size of each chunk in minutes (default 100).
+            filename (str): The output JSON file name.
+            
+        Returns:
+            None. Data is written to the specified JSON file.
+        """
+        try:
+            symbols = ["BTC/USDT", "ETH/USDT", "ETH/BTC"]
+            # Open file and write the opening bracket for a JSON array.
+            with open(filename, 'w') as f:
+                f.write("[\n")
+                first_record = True  # For proper comma handling.
+                current_start = start_dt
+                while current_start < end_dt:
+                    current_end = current_start + timedelta(minutes=chunk_minutes)
+                    if current_end > end_dt:
+                        current_end = end_dt
+                    logger.info(f"Fetching data from {current_start.isoformat()} to {current_end.isoformat()}")
+                    # For each symbol, fetch candles within this window.
+                    data_by_symbol = {}
+                    for sym in symbols:
+                        candles = []
+                        since = self.exchange.parse8601(current_start.isoformat() + "Z")
+                        end_timestamp = self.exchange.parse8601(current_end.isoformat() + "Z")
+                        while since < end_timestamp:
+                            batch = self.exchange.fetch_ohlcv(sym, timeframe=timeframe, since=since, limit=limit)
+                            if not batch:
+                                break
+                            for candle in batch:
+                                if candle[0] >= end_timestamp:
+                                    break
+                                candles.append(candle)
+                            since = batch[-1][0] + 1
+                            if len(batch) < limit:
+                                break
+                        # Map each candle's timestamp to its close price.
+                        rec_dict = {datetime.utcfromtimestamp(candle[0]/1000).isoformat() + "Z": candle[4] for candle in candles}
+                        data_by_symbol[sym] = rec_dict
+                        logger.info(f"Fetched {len(rec_dict)} candles for {sym} in this window.")
+                    # Find common timestamps across all symbols.
+                    common_ts = set(data_by_symbol[symbols[0]].keys())
+                    for sym in symbols[1:]:
+                        common_ts = common_ts.intersection(set(data_by_symbol[sym].keys()))
+                    common_ts = sorted(common_ts)
+                    # For each common timestamp, merge the data.
+                    for ts in common_ts:
+                        record = {"timestamp": ts}
+                        for sym in symbols:
+                            record[sym] = data_by_symbol[sym][ts]
+                        # Write record as a JSON object. If it's not the first record, prepend a comma.
+                        if not first_record:
+                            f.write(",\n")
+                        else:
+                            first_record = False
+                        json.dump(record, f, indent=4)
+                    current_start = current_end
+                # Close the JSON array.
+                f.write("\n]")
+            logger.info(f"All historical triangle data has been saved to {filename}.")
+        except Exception as e:
+            logger.error(f"Error fetching all historical triangle data incrementally: {e}")
+
+    # ---------------------------
+    # Backtesting Function
+    # ---------------------------
+    def backtest_triangle_arbitrage_minute(self, historical_data, trade_fraction=0.1, threshold=0.002):
+        """
+        Backtests triangle arbitrage using historical minute data.
+        
+        Parameters:
+            historical_data (list): A list of merged records. Each record is a dict with keys:
+                "timestamp", "BTC/USDT", "ETH/USDT", "ETH/BTC" (values are the close prices).
+            trade_fraction (float): Fraction of the portfolio to use per trade (default 0.1).
+            threshold (float): Minimum arbitrage excess over 1 required to trigger a trade (default 0.002, or 0.2%).
+        
+        Simulation:
+            - Start with an initial portfolio (e.g., 10,000 USDT).
+            - For each record (representing one minute), compute arbitrage signal using check_triangle_arbitrage.
+            - If either cycle factor exceeds 1 + threshold, simulate a trade:
+                  new_portfolio = current_portfolio * [1 + trade_fraction * (selected_factor - 1)]
+            - Track the portfolio value and trade returns.
+        
+        Returns:
+            dict: Contains:
+                - portfolio_history: List of portfolio values over time.
+                - cumulative_return: Overall portfolio return.
+                - average_return: Average return per trade.
+                - std_return: Standard deviation of trade returns.
+                - sharpe_ratio: Annualized Sharpe ratio (using sqrt(525600) for minute data).
+                - max_drawdown: Maximum drawdown.
+        """
+        try:
+            if not historical_data or len(historical_data) == 0:
+                logger.error("No historical data provided for backtesting.")
+                return None
+
+            initial_portfolio = 10000.0
+            current_portfolio = initial_portfolio
+            portfolio_history = [current_portfolio]
+            trade_returns = []
+
+            for i, record in enumerate(historical_data):
+                arb_signal = self.check_triangle_arbitrage(threshold=threshold, data=record)
+                if arb_signal is None:
+                    logger.warning(f"Record {i}: No arbitrage signal (data issue).")
+                    trade_returns.append(0)
+                    portfolio_history.append(current_portfolio)
+                    continue
+
+                cycle1 = arb_signal.get("Cycle1_factor", 0)
+                cycle2 = arb_signal.get("Cycle2_factor", 0)
+                opp1 = arb_signal.get("Cycle1_opportunity", False)
+                opp2 = arb_signal.get("Cycle2_opportunity", False)
+
+                if opp1 or opp2:
+                    selected_factor = max(cycle1 if opp1 else 0, cycle2 if opp2 else 0)
+                    profit_pct = selected_factor - 1.0
+                    trade_profit = current_portfolio * trade_fraction * profit_pct
+                    current_portfolio += trade_profit
+                    risked = current_portfolio - trade_profit if (current_portfolio - trade_profit) != 0 else 1
+                    trade_return = trade_profit / risked
+                    logger.info(f"Record {i}: Trade executed (factor: {selected_factor:.4f}, profit_pct: {profit_pct:.4f}), new portfolio: {current_portfolio:.2f}")
+                else:
+                    trade_return = 0
+                    logger.info(f"Record {i}: No arbitrage opportunity detected.")
+                
+                trade_returns.append(trade_return)
+                portfolio_history.append(current_portfolio)
+
+            cumulative_return = (current_portfolio / initial_portfolio) - 1
+            avg_return = sum(trade_returns) / len(trade_returns) if trade_returns else 0
+            std_return = (sum((r - avg_return) ** 2 for r in trade_returns) / len(trade_returns)) ** 0.5 if trade_returns else 0
+            sharpe_ratio = (avg_return / std_return * (525600 ** 0.5)) if std_return != 0 else float('inf')
+            peak = portfolio_history[0]
+            max_drawdown = 0
+            for value in portfolio_history:
+                if value > peak:
+                    peak = value
+                drawdown = (peak - value) / peak
+                if drawdown > max_drawdown:
+                    max_drawdown = drawdown
+
+            result = {
+                "portfolio_history": portfolio_history,
+                "cumulative_return": cumulative_return,
+                "average_return": avg_return,
+                "std_return": std_return,
+                "sharpe_ratio": sharpe_ratio,
+                "max_drawdown": max_drawdown
+            }
+            logger.info(f"Backtest result: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error during backtesting: {e}")
+            return None
+
 def main():
     """
     Main function to fetch essential account details and orders.
@@ -795,6 +1077,65 @@ def main():
 
     # Print to console as well
     trader.print_account_info()
+
+    # Part 1: Fetch triangle market data and store it
+    triangle_data = trader.fetch_triangle_market_data()
+    df_triangle = trader.store_triangle_data_to_json(triangle_data)
+    if df_triangle is not None:
+        print("Triangle market data stored:")
+        print(df_triangle)
+    
+    # Part 2: Generate triangle arbitrage signal using the fetched data
+    arb_signal = trader.check_triangle_arbitrage(threshold=0.002, data=triangle_data)
+    if arb_signal:
+        print("Triangle arbitrage signal:")
+        print(arb_signal)
+    else:
+        print("No triangle arbitrage signal or error encountered.")
+    
+
+    # --- HISTORICAL DATA SECTION ---
+    # Define the period
+    # end_dt = datetime.utcnow()
+    # start_dt = end_dt - timedelta(days=30)
+    # print(f"Fetching historical triangle minute data from {start_dt.isoformat()} to {end_dt.isoformat()}")
+    
+    # # Use the incremental fetching function.
+    # trader.fetch_all_historical_triangle_data_incremental(
+    #     start_dt=start_dt,
+    #     end_dt=end_dt,
+    #     timeframe="1m",
+    #     limit=100,
+    #     chunk_minutes=100,
+    #     filename="triangle_market_data_historical.json"
+    # )
+    
+    # Load the stored data from JSON for backtesting.
+    try:
+        historical_data = pd.read_json("triangle_market_data_historical.json", orient="records")
+        historical_data = historical_data.to_dict(orient="records")
+        print("Historical Triangle Market Data (first 5 records):")
+        print(pd.DataFrame(historical_data).head())
+    except Exception as e:
+        logger.error(f"Error reading historical triangle data from JSON: {e}")
+        return
+
+    # Run backtest using the fetched historical data.
+    backtest_result = trader.backtest_triangle_arbitrage_minute(
+        historical_data=historical_data,
+        trade_fraction=0.1,
+        threshold=0.002
+    )
+    if backtest_result:
+        print("Backtest Results:")
+        print(f"Cumulative Return: {backtest_result['cumulative_return']*100:.2f}%")
+        print(f"Average Return per Trade: {backtest_result['average_return']*100:.2f}%")
+        print(f"Standard Deviation of Returns: {backtest_result['std_return']*100:.2f}%")
+        print(f"Annualized Sharpe Ratio: {backtest_result['sharpe_ratio']:.2f}")
+        print(f"Maximum Drawdown: {backtest_result['max_drawdown']*100:.2f}%")
+    else:
+        print("Backtest failed or no data available.")
+    
 
 def test_orders():
     """
